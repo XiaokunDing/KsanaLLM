@@ -7,6 +7,7 @@ import asyncio
 import csv
 import http
 import random
+import sys
 import time
 from functools import partial
 from dataclasses import dataclass, field
@@ -23,6 +24,26 @@ from tqdm.asyncio import tqdm
 # NOTE(karlluo): mindie-service wont return tokens, we need encode tokens to get output tokens
 from transformers import AutoTokenizer
 from longbench_reader import LongBenchV2Dataset
+
+
+class Tee:
+    """Mirror writes to a stream to both the original stream and a log file."""
+
+    def __init__(self, stream, log_file):
+        self.stream = stream
+        self.log_file = log_file
+
+    def write(self, data):
+        self.stream.write(data)
+        self.log_file.write(data)
+
+    def flush(self):
+        self.stream.flush()
+        self.log_file.flush()
+
+    def fileno(self):
+        return self.stream.fileno()
+
 
 # (prompt len, output len, input token num, output token num,
 #  request latency, first token latency, inter token latencies)
@@ -397,6 +418,11 @@ def args_config():
                         action='store_true',
                         help="Whether to show only decode token throughput,"
                             " which will override the default total token throughput")
+    parser.add_argument('--log_file',
+                        type=str,
+                        default="ksana_llm.log",
+                        help="Path to the log file where benchmark output is saved."
+                             " Set to empty string to disable file logging.")
     args = parser.parse_args()
     if "," in args.host:
         args.host = args.host.split(",")
@@ -1066,216 +1092,226 @@ def main(args: argparse.Namespace):
     global REQUEST_LATENCY
     check_args(args)
 
-    np.random.seed(args.seed)
-    random.seed(args.seed)
+    log_fh = None
+    if args.log_file:
+        log_fh = open(args.log_file, "a")
+        sys.stdout = Tee(sys.__stdout__, log_fh)
 
-    tokenizer = None
-    api_url = "http://##host##:##port##/generate"
+    try:
+        np.random.seed(args.seed)
+        random.seed(args.seed)
 
-    if args.backend == "trt-llm":
-        api_url = "http://" + args.host + ":" + str(
-            args.port) + "/v2/models/ensemble/generate"
-        if args.stream:
-            api_url += "_stream"  # generate_stream
-    elif args.backend in ["ksana-server", "vllm-server"]:
-        api_url = "http://" + args.host + ":" + str(args.port) + "/v1/chat"
-        if args.model_type != "deepseek_r1":
-            args.model_type = "empty"  # 在线服务不需要手动拼接前后缀
-    elif args.backend == "triton-grpc":
-        api_url = f"{args.host}:{args.port}"
+        tokenizer = None
+        api_url = "http://##host##:##port##/generate"
 
-    # NOTE: mindie-service/TensorRT-LLM wont return tokens, we need encode tokens to get output tokens
-    if args.backend in ["mindie-service", "trt-llm", "vllm", "triton-grpc"] \
-       or args.chat_template or args.random_input_len:
-        if args.tokenizer_path is not None:
-            tokenizer = AutoTokenizer.from_pretrained(
-                args.tokenizer_path,
-                revision=None,
-                padding_side="left",
-                truncation_side="left",
-                trust_remote_code=True,
-                use_fast=True
+        if args.backend == "trt-llm":
+            api_url = "http://" + args.host + ":" + str(
+                args.port) + "/v2/models/ensemble/generate"
+            if args.stream:
+                api_url += "_stream"  # generate_stream
+        elif args.backend in ["ksana-server", "vllm-server"]:
+            api_url = "http://" + args.host + ":" + str(args.port) + "/v1/chat"
+            if args.model_type != "deepseek_r1":
+                args.model_type = "empty"  # 在线服务不需要手动拼接前后缀
+        elif args.backend == "triton-grpc":
+            api_url = f"{args.host}:{args.port}"
+
+        # NOTE: mindie-service/TensorRT-LLM wont return tokens, we need encode tokens to get output tokens
+        if args.backend in ["mindie-service", "trt-llm", "vllm", "triton-grpc"] \
+           or args.chat_template or args.random_input_len:
+            if args.tokenizer_path is not None:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    args.tokenizer_path,
+                    revision=None,
+                    padding_side="left",
+                    truncation_side="left",
+                    trust_remote_code=True,
+                    use_fast=True
+                )
+
+        # Read data from the dataset_path
+        if args.dataset_name == "sharegpt500":
+            import os
+            inputs = read_from_csv(os.path.join(os.path.dirname(__file__), "share_gpt_500.csv"),
+                                    args.col_idx)
+        elif args.dataset_name.startswith("longbenchV2"):
+            with_ctx = True if "withCtx" in args.dataset_name else False
+            # we need encode tokens to check and truncate the long-context prompts
+            longbench_dataset = LongBenchV2Dataset(file_path=args.dataset_path, with_context=with_ctx,
+                                                   tokenizer_path=args.tokenizer_path)
+            inputs = longbench_dataset.get_all_prompts()
+        else:
+            inputs = read_from_csv(args.dataset_path, args.col_idx)
+
+        # Adjust the length of the input list based on the provided arguments
+        if args.shuffle:
+            random.shuffle(inputs)
+
+        if args.structured_output_file is not None:
+            with open(args.structured_output_file, "r") as file:
+                args.structured_output_regex = file.read()
+
+        inputs = adjust_list_length(inputs, args)
+        inputs = [construct_request_data(tokenizer, input, args) for input in inputs]
+        perf_result_list: List[Tuple[BenchmarkMetrics, BenchmarkStreamMetrics]] = []
+        # requst_rate_list: List[Tuple[request_rate, avg_latency, avg_TTFT]]
+        request_rate_list: List[Tuple[float, float, float]] = []
+        while True:
+            if args.clear_cache:
+                # cmake -DWITH_CLEAR_CACHE=ON
+                clear_cache_data = {
+                    "input_tokens": [0, 0],
+                    "sampling_config": {
+                        "max_new_tokens": 1
+                    }
+                }
+
+                conn = http.client.HTTPConnection(args.host + ":" + str(args.port))
+                conn.request("POST", '/generate',
+                             body=orjson.dumps(clear_cache_data),
+                             headers={'Content-Type': 'application/json'})
+
+                conn.getresponse()
+            metrics = BenchmarkMetrics()
+            metrics.request_rate = search_request_rate(args, request_rate_list)
+            args.request_rate = metrics.request_rate
+            if metrics.request_rate == -1:
+                break
+            metrics.concurrency = args.concurrency
+            for iter in range(args.warmup_num_iters):
+                print(f"Start warmup iteration {iter} with request rate {metrics.request_rate:.3f}")
+                run_benchmark(args, api_url, inputs, tokenizer)
+            REQUEST_LATENCY.clear()
+
+            # Record the start time of the benchmark
+            benchmark_start_time = time.perf_counter()
+            for iter in range(args.repeat_num_iters):
+                print(f"Start profile iteration {iter} with request rate {metrics.request_rate:.3f}")
+                result_list = run_benchmark(args, api_url, inputs, tokenizer)
+            # Record the end time of the benchmark
+            benchmark_end_time = time.perf_counter()
+
+            # Calculate the total benchmark time
+            metrics.total_latency = (
+                benchmark_end_time - benchmark_start_time
+            ) / args.repeat_num_iters
+            # Calculate the request throughput
+            metrics.request_throughput = len(inputs) / metrics.total_latency
+
+            # Compute the latency statistics
+            metrics.avg_latency = np.mean([latency for _, _, _, _, latency, _, _ in REQUEST_LATENCY])
+            metrics.percentile_latency = [
+                (percentile, np.percentile(
+                    [latency for _, _, _, _, latency, _, _ in REQUEST_LATENCY], percentile))
+                for percentile in args.percentiles
+            ]
+            metrics.avg_input_chars = np.mean(
+                [prompt_len for prompt_len, _, _, _, _, _, _ in REQUEST_LATENCY]
+            )
+            metrics.avg_output_chars = np.mean(
+                [output_len for _, output_len, _, _, _, _, _ in REQUEST_LATENCY]
+            )
+            metrics.avg_input_tokens = np.mean(
+                [input_tokens_num for _, _, input_tokens_num, _, _, _, _ in REQUEST_LATENCY]
+            )
+            metrics.avg_output_tokens = np.mean(
+                [output_tokens_num for _, _, _, output_tokens_num, _, _, _ in REQUEST_LATENCY]
             )
 
-    # Read data from the dataset_path
-    if args.dataset_name == "sharegpt500":
-        import os
-        inputs = read_from_csv(os.path.join(os.path.dirname(__file__), "share_gpt_500.csv"),
-                                args.col_idx)
-    elif args.dataset_name.startswith("longbenchV2"):
-        with_ctx = True if "withCtx" in args.dataset_name else False
-        # we need encode tokens to check and truncate the long-context prompts
-        longbench_dataset = LongBenchV2Dataset(file_path=args.dataset_path, with_context=with_ctx,
-                                               tokenizer_path=args.tokenizer_path)
-        inputs = longbench_dataset.get_all_prompts()
-    else:
-        inputs = read_from_csv(args.dataset_path, args.col_idx)
+            # Calculate the token throughput
+            summary_token = metrics.avg_input_tokens + metrics.avg_output_tokens
+            if args.show_decode_token_throughput:
+                summary_token = metrics.avg_output_tokens - 1  # 只统计decode，删掉一个prefill的token
+            metrics.avg_tokens_per_sec = (summary_token
+                ) * len(REQUEST_LATENCY) / metrics.total_latency / args.repeat_num_iters
 
-    # Adjust the length of the input list based on the provided arguments
-    if args.shuffle:
-        random.shuffle(inputs)
+            print(metrics)
 
-    if args.structured_output_file is not None:
-        with open(args.structured_output_file, "r") as file:
-            args.structured_output_regex = file.read()
-
-    inputs = adjust_list_length(inputs, args)
-    inputs = [construct_request_data(tokenizer, input, args) for input in inputs]
-    perf_result_list: List[Tuple[BenchmarkMetrics, BenchmarkStreamMetrics]] = []
-    # requst_rate_list: List[Tuple[request_rate, avg_latency, avg_TTFT]]
-    request_rate_list: List[Tuple[float, float, float]] = []
-    while True:
-        if args.clear_cache:
-            # cmake -DWITH_CLEAR_CACHE=ON
-            clear_cache_data = {
-                "input_tokens": [0, 0],
-                "sampling_config": {
-                    "max_new_tokens": 1
-                }
-            }
-
-            conn = http.client.HTTPConnection(args.host + ":" + str(args.port))
-            conn.request("POST", '/generate',
-                         body=orjson.dumps(clear_cache_data),
-                         headers={'Content-Type': 'application/json'})
-
-            conn.getresponse()
-        metrics = BenchmarkMetrics()
-        metrics.request_rate = search_request_rate(args, request_rate_list)
-        args.request_rate = metrics.request_rate
-        if metrics.request_rate == -1:
-            break
-        metrics.concurrency = args.concurrency
-        for iter in range(args.warmup_num_iters):
-            print(f"Start warmup iteration {iter} with request rate {metrics.request_rate:.3f}")
-            run_benchmark(args, api_url, inputs, tokenizer)
-        REQUEST_LATENCY.clear()
-
-        # Record the start time of the benchmark
-        benchmark_start_time = time.perf_counter()
-        for iter in range(args.repeat_num_iters):
-            print(f"Start profile iteration {iter} with request rate {metrics.request_rate:.3f}")
-            result_list = run_benchmark(args, api_url, inputs, tokenizer)
-        # Record the end time of the benchmark
-        benchmark_end_time = time.perf_counter()
-
-        # Calculate the total benchmark time
-        metrics.total_latency = (
-            benchmark_end_time - benchmark_start_time
-        ) / args.repeat_num_iters
-        # Calculate the request throughput
-        metrics.request_throughput = len(inputs) / metrics.total_latency
-
-        # Compute the latency statistics
-        metrics.avg_latency = np.mean([latency for _, _, _, _, latency, _, _ in REQUEST_LATENCY])
-        metrics.percentile_latency = [
-            (percentile, np.percentile(
-                [latency for _, _, _, _, latency, _, _ in REQUEST_LATENCY], percentile))
-            for percentile in args.percentiles
-        ]
-        metrics.avg_input_chars = np.mean(
-            [prompt_len for prompt_len, _, _, _, _, _, _ in REQUEST_LATENCY]
-        )
-        metrics.avg_output_chars = np.mean(
-            [output_len for _, output_len, _, _, _, _, _ in REQUEST_LATENCY]
-        )
-        metrics.avg_input_tokens = np.mean(
-            [input_tokens_num for _, _, input_tokens_num, _, _, _, _ in REQUEST_LATENCY]
-        )
-        metrics.avg_output_tokens = np.mean(
-            [output_tokens_num for _, _, _, output_tokens_num, _, _, _ in REQUEST_LATENCY]
-        )
-
-        # Calculate the token throughput
-        summary_token = metrics.avg_input_tokens + metrics.avg_output_tokens
-        if args.show_decode_token_throughput:
-            summary_token = metrics.avg_output_tokens - 1  # 只统计decode，删掉一个prefill的token
-        metrics.avg_tokens_per_sec = (summary_token
-            ) * len(REQUEST_LATENCY) / metrics.total_latency / args.repeat_num_iters
-
-        print(metrics)
-
-        stream_metrics = BenchmarkStreamMetrics()
-        if args.stream:  # TTFT, TPOT and ITL are only available in stream mode
-            first_token_latencies = [
-                first_token_latency
-                for _, _, _, _, _, first_token_latency, _ in REQUEST_LATENCY
-            ]
-            if len(first_token_latencies) > 0:
-                stream_metrics.avg_first_token_latency = np.mean(first_token_latencies)
-                stream_metrics.median_first_token_latency = np.median(first_token_latencies)
-                stream_metrics.percentiles_first_token_latency = [
-                    (percentile, np.percentile(first_token_latencies, percentile))
-                    for percentile in args.percentiles
+            stream_metrics = BenchmarkStreamMetrics()
+            if args.stream:  # TTFT, TPOT and ITL are only available in stream mode
+                first_token_latencies = [
+                    first_token_latency
+                    for _, _, _, _, _, first_token_latency, _ in REQUEST_LATENCY
                 ]
+                if len(first_token_latencies) > 0:
+                    stream_metrics.avg_first_token_latency = np.mean(first_token_latencies)
+                    stream_metrics.median_first_token_latency = np.median(first_token_latencies)
+                    stream_metrics.percentiles_first_token_latency = [
+                        (percentile, np.percentile(first_token_latencies, percentile))
+                        for percentile in args.percentiles
+                    ]
 
-            inter_token_latencies = [
-                inter_token_latency for _, _, _, _, _, _, inter_token_latencies in REQUEST_LATENCY
-                for inter_token_latency in inter_token_latencies
-            ]
-            if len(inter_token_latencies) > 0:
-                stream_metrics.avg_inter_token_latency = np.mean(inter_token_latencies)
-                stream_metrics.median_inter_token_latency = np.median(inter_token_latencies)
-                stream_metrics.percentiles_inter_token_latency = [
-                    (percentile, np.percentile(inter_token_latencies, percentile))
-                    for percentile in args.percentiles
+                inter_token_latencies = [
+                    inter_token_latency for _, _, _, _, _, _, inter_token_latencies in REQUEST_LATENCY
+                    for inter_token_latency in inter_token_latencies
                 ]
+                if len(inter_token_latencies) > 0:
+                    stream_metrics.avg_inter_token_latency = np.mean(inter_token_latencies)
+                    stream_metrics.median_inter_token_latency = np.median(inter_token_latencies)
+                    stream_metrics.percentiles_inter_token_latency = [
+                        (percentile, np.percentile(inter_token_latencies, percentile))
+                        for percentile in args.percentiles
+                    ]
 
-            latencies_per_out_token = [
-                (latency - first_token_latency) / (output_tokens_num - 1)
-                for _, _, _, output_tokens_num, latency, first_token_latency, _ in REQUEST_LATENCY
-                if output_tokens_num > 1
-            ]
-            if len(latencies_per_out_token) > 0:
-                stream_metrics.avg_latency_per_out_token = np.mean(latencies_per_out_token)
-                stream_metrics.median_latency_per_out_token = np.median(latencies_per_out_token)
-                stream_metrics.percentiles_latency_per_out_token = [
-                    (percentile, np.percentile(latencies_per_out_token, percentile))
-                    for percentile in args.percentiles
+                latencies_per_out_token = [
+                    (latency - first_token_latency) / (output_tokens_num - 1)
+                    for _, _, _, output_tokens_num, latency, first_token_latency, _ in REQUEST_LATENCY
+                    if output_tokens_num > 1
                 ]
+                if len(latencies_per_out_token) > 0:
+                    stream_metrics.avg_latency_per_out_token = np.mean(latencies_per_out_token)
+                    stream_metrics.median_latency_per_out_token = np.median(latencies_per_out_token)
+                    stream_metrics.percentiles_latency_per_out_token = [
+                        (percentile, np.percentile(latencies_per_out_token, percentile))
+                        for percentile in args.percentiles
+                    ]
 
-            print(stream_metrics)
+                print(stream_metrics)
 
-        perf_result_list.append((metrics, stream_metrics))
-        request_rate_list.append((metrics.request_rate, metrics.avg_latency, stream_metrics.avg_first_token_latency))
-        REQUEST_LATENCY.clear()
+            perf_result_list.append((metrics, stream_metrics))
+            request_rate_list.append((metrics.request_rate, metrics.avg_latency, stream_metrics.avg_first_token_latency))
+            REQUEST_LATENCY.clear()
 
-    if args.output_csv is not None:
-        with open(args.output_csv, "w", newline='') as fs:
-            writer = csv.writer(fs)
-            for idx in range(len(result_list)):
-                result = result_list[idx]
-                writer.writerow([result.replace("</s>", "")])
+        if args.output_csv is not None:
+            with open(args.output_csv, "w", newline='') as fs:
+                writer = csv.writer(fs)
+                for idx in range(len(result_list)):
+                    result = result_list[idx]
+                    writer.writerow([result.replace("</s>", "")])
 
-    if args.perf_csv is not None:
-        with open(args.perf_csv, "w", newline='') as fs:
-            writer = csv.writer(fs)
-            header = ["Request rate", "Concurrency", "Total latency", "Request throughput", "Avg latency",
-                      "Avg input chars", "Avg output chars", "Avg input tokens", "Avg output tokens",
-                      "Token throughput"]
-            header.extend([f"P{percentile} latency" for percentile in args.percentiles])
-            if args.stream:
-                header.extend(["Avg TTFT", "Median TTFT"] +
-                              [f"P{percentile} TTFT" for percentile in args.percentiles] +
-                              ["Avg ITL", "Median ITL"] +
-                              [f"P{percentile} ITL" for percentile in args.percentiles] +
-                              ["Avg TPOT", "Median TPOT"] +
-                              [f"P{percentile} TPOT" for percentile in args.percentiles])
-            writer.writerow(header)
-            for (metrics, stream_metrics) in perf_result_list:
-                def process_metrics(metrics_values, row):
-                    for value in metrics_values:
-                        if isinstance(value, list):
-                            row.extend([f"{percentile_value[1]:.5f}" for percentile_value in value])
-                        else:
-                            row.append(f"{value:.5f}")
-
-                row = []
-                process_metrics(metrics.__dict__.values(), row)
+        if args.perf_csv is not None:
+            with open(args.perf_csv, "w", newline='') as fs:
+                writer = csv.writer(fs)
+                header = ["Request rate", "Concurrency", "Total latency", "Request throughput", "Avg latency",
+                          "Avg input chars", "Avg output chars", "Avg input tokens", "Avg output tokens",
+                          "Token throughput"]
+                header.extend([f"P{percentile} latency" for percentile in args.percentiles])
                 if args.stream:
-                    process_metrics(stream_metrics.__dict__.values(), row)
-                writer.writerow(row)
+                    header.extend(["Avg TTFT", "Median TTFT"] +
+                                  [f"P{percentile} TTFT" for percentile in args.percentiles] +
+                                  ["Avg ITL", "Median ITL"] +
+                                  [f"P{percentile} ITL" for percentile in args.percentiles] +
+                                  ["Avg TPOT", "Median TPOT"] +
+                                  [f"P{percentile} TPOT" for percentile in args.percentiles])
+                writer.writerow(header)
+                for (metrics, stream_metrics) in perf_result_list:
+                    def process_metrics(metrics_values, row):
+                        for value in metrics_values:
+                            if isinstance(value, list):
+                                row.extend([f"{percentile_value[1]:.5f}" for percentile_value in value])
+                            else:
+                                row.append(f"{value:.5f}")
 
+                    row = []
+                    process_metrics(metrics.__dict__.values(), row)
+                    if args.stream:
+                        process_metrics(stream_metrics.__dict__.values(), row)
+                    writer.writerow(row)
+
+    finally:
+        if log_fh is not None:
+            sys.stdout = sys.__stdout__
+            log_fh.close()
 
 if __name__ == "__main__":
     uvloop.install()
