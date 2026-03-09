@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "ksana_llm/cache_manager/cache_manager_interface.h"
@@ -185,6 +186,12 @@ class LlmRuntime {
   std::vector<std::shared_ptr<Sampler>> samplers_;
 
   std::shared_ptr<DraftGeneratorInterface> draft_generator_ = nullptr;
+
+  // Mock draft hit rates parsed from MOCK_DRAFT_HIT_RATES env var (e.g. "0.82,0.50").
+  // When non-empty, DraftTokenFilter uses these rates deterministically instead of comparing
+  // actual sampling results, ensuring reproducible benchmark runs with DECODE_NODE_BENCHMARK.
+  // rates_[0] applies to MTP draft tokens; rates_[1] applies to Trie draft tokens.
+  std::vector<float> mock_draft_hit_rates_;
 
   // Threadpool used to metrics report.
   std::shared_ptr<ThreadPool> threadpool_ = nullptr;
