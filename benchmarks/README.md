@@ -38,7 +38,12 @@ cd ${GIT_PROJECT_REPO_ROOT}/benchmarks
 # benchmark
 python benchmark_throughput.py --input_csv benchmark_input.csv --port 8080 \
     --backend ksana --model_type llama \
-    --perf_csv ksana_perf.csv > ksana_stdout.txt 2>&1
+    --perf_csv ksana_perf.csv
+
+# benchmark with log file (output saved to ksana_llm.log by default)
+python benchmark_throughput.py --input_csv benchmark_input.csv --port 8080 \
+    --backend ksana --model_type llama \
+    --perf_csv ksana_perf.csv --log_file ksana_llm.log
 
 # benchmark triton_backend with grpc streaming
 python benchmark_throughput.py --host localhost \

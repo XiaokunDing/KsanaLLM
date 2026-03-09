@@ -10,4 +10,5 @@ python benchmark_throughput.py \
     --random_input_len ${INPUT_LEN} \
     --max_new_tokens ${OUTPUT_LEN} \
     --ignore_eos \
-    --tokenizer_path /dockerdata/models/DeepSeek-R1
+    --tokenizer_path /dockerdata/models/DeepSeek-R1 \
+    --log_file ksana_llm.log
