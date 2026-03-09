@@ -362,4 +362,136 @@ TEST_F(DraftTokenFilterTest, GrammarMatcherAcceptsAllTokens) {
   EXPECT_EQ(req->accepted_tokens[2], 30);
   EXPECT_EQ(req->generated_token, 40);
 }
+
+// Tests for MOCK_DRAFT_HIT_RATES deterministic mocking
+// Verifies that DraftTokenFilter uses mock rates instead of token comparison when
+// MOCK_DRAFT_HIT_RATES env var is set, ensuring reproducible benchmark runs.
+class MockDraftHitRatesTest : public testing::Test {
+ protected:
+  void SetUp() override {
+    runtime_config_ = RuntimeConfig();
+    batch_scheduler_config_ = BatchSchedulerConfig();
+    context_ = std::make_shared<Context>(1, 1, 1);
+  }
+
+  void TearDown() override { unsetenv("MOCK_DRAFT_HIT_RATES"); }
+
+  std::shared_ptr<InferRequest> CreateMockInferRequest(const std::vector<int>& draft_tokens_mtp,
+                                                       const std::vector<int>& draft_tokens_trie,
+                                                       const std::vector<int>& sampling_result_tokens) {
+    auto python_input = std::make_shared<KsanaPythonInput>();
+    python_input->model_name = "test_model";
+    python_input->input_tokens = {1, 2, 3};
+
+    auto req_ctx = std::make_shared<std::unordered_map<std::string, std::string>>();
+    auto request = std::make_shared<Request>(python_input, req_ctx);
+
+    request->req_id = 1;
+    request->input_tokens = {1, 2, 3};
+
+    auto infer_req = std::make_shared<InferRequest>(request, 0);
+    infer_req->draft_tokens.mtp = draft_tokens_mtp;
+    infer_req->draft_tokens.trie = draft_tokens_trie;
+    infer_req->sampling_result_tokens = sampling_result_tokens;
+
+    return infer_req;
+  }
+
+  RuntimeConfig runtime_config_;
+  BatchSchedulerConfig batch_scheduler_config_;
+  std::shared_ptr<Context> context_;
+};
+
+TEST_F(MockDraftHitRatesTest, MtpRateAcceptsAllMtpThenPartialTrie) {
+  // rates[0]=1.0 (all MTP accepted), rates[1]=0.50 (half Trie accepted)
+  // mtp=[10], trie=[20, 30]
+  // Expected: mtp_hit=round(1.0*1)=1 (all), trie_hit=round(0.5*2)=1 → total=2
+  setenv("MOCK_DRAFT_HIT_RATES", "1.0,0.50", 1);
+  auto llm_runtime = std::make_shared<LlmRuntime>(batch_scheduler_config_, runtime_config_, context_);
+
+  // sampling_result does NOT match draft_tokens (would normally yield 0 hits)
+  auto req = CreateMockInferRequest({10}, {20, 30}, {99, 99, 99, 99});
+  std::vector<std::shared_ptr<InferRequest>> reqs = {req};
+
+  llm_runtime->DraftTokenFilter(reqs);
+
+  // Mock rates: mtp_hit=1 (all), trie_hit=1 → draft_hit_num=2
+  EXPECT_EQ(req->accepted_tokens.size(), 2u);
+  EXPECT_EQ(req->accepted_tokens[0], 10);  // mtp token
+  EXPECT_EQ(req->accepted_tokens[1], 20);  // first trie token
+  // generated_token = sampling_result_tokens[2] = 99
+  EXPECT_EQ(req->generated_token, 99);
+}
+
+TEST_F(MockDraftHitRatesTest, MtpRatePartialMtpBlocksTrie) {
+  // rates[0]=0.40 (partial MTP), rates[1]=1.0 (would accept all Trie)
+  // mtp=[10, 11], trie=[20, 30]
+  // Expected: mtp_hit=round(0.40*2)=1 < mtp_size=2 → trie blocked → total=1
+  setenv("MOCK_DRAFT_HIT_RATES", "0.40,1.0", 1);
+  auto llm_runtime = std::make_shared<LlmRuntime>(batch_scheduler_config_, runtime_config_, context_);
+
+  // sampling_result matches all draft tokens (would normally yield 4 hits without mock)
+  auto req = CreateMockInferRequest({10, 11}, {20, 30}, {10, 11, 20, 30, 99});
+  std::vector<std::shared_ptr<InferRequest>> reqs = {req};
+
+  llm_runtime->DraftTokenFilter(reqs);
+
+  // Mock rates: mtp_hit=round(0.40*2)=1 < 2 → trie blocked → draft_hit_num=1
+  EXPECT_EQ(req->accepted_tokens.size(), 1u);
+  EXPECT_EQ(req->accepted_tokens[0], 10);
+  EXPECT_EQ(req->generated_token, 11);  // sampling_result_tokens[1]
+}
+
+TEST_F(MockDraftHitRatesTest, NoMtpOnlyTrieUsesFirstRate) {
+  // No MTP tokens, only Trie: rates[0] applies to Trie
+  // rates[0]=0.82, trie=[20, 30, 40]
+  // Expected: trie_hit=round(0.82*3)=round(2.46)=2 (rounds down) → total=2
+  setenv("MOCK_DRAFT_HIT_RATES", "0.82,0.50", 1);
+  auto llm_runtime = std::make_shared<LlmRuntime>(batch_scheduler_config_, runtime_config_, context_);
+
+  auto req = CreateMockInferRequest({}, {20, 30, 40}, {99, 99, 99, 99});
+  std::vector<std::shared_ptr<InferRequest>> reqs = {req};
+
+  llm_runtime->DraftTokenFilter(reqs);
+
+  // Mock rates (no MTP): trie_hit=round(0.82*3)=2 → draft_hit_num=2
+  EXPECT_EQ(req->accepted_tokens.size(), 2u);
+  EXPECT_EQ(req->accepted_tokens[0], 20);
+  EXPECT_EQ(req->accepted_tokens[1], 30);
+  EXPECT_EQ(req->generated_token, 99);  // sampling_result_tokens[2]
+}
+
+TEST_F(MockDraftHitRatesTest, MockRatesProduceSameResultAcrossMultipleCalls) {
+  // Verify determinism: two calls with the same input produce the same result.
+  setenv("MOCK_DRAFT_HIT_RATES", "0.82,0.50", 1);
+  auto llm_runtime = std::make_shared<LlmRuntime>(batch_scheduler_config_, runtime_config_, context_);
+
+  auto req1 = CreateMockInferRequest({10}, {20, 30, 40}, {99, 88, 77, 66, 55});
+  auto req2 = CreateMockInferRequest({10}, {20, 30, 40}, {11, 22, 33, 44, 55});
+  std::vector<std::shared_ptr<InferRequest>> reqs1 = {req1};
+  std::vector<std::shared_ptr<InferRequest>> reqs2 = {req2};
+
+  llm_runtime->DraftTokenFilter(reqs1);
+  llm_runtime->DraftTokenFilter(reqs2);
+
+  // Both calls must accept the same number of draft tokens (mock is deterministic)
+  EXPECT_EQ(req1->accepted_tokens.size(), req2->accepted_tokens.size());
+}
+
+TEST_F(MockDraftHitRatesTest, WithoutMockRatesUsesTokenComparison) {
+  // Without MOCK_DRAFT_HIT_RATES, the original comparison logic is used.
+  // draft=[10, 20], sampling=[10, 99, 77] → only first token matches
+  auto llm_runtime = std::make_shared<LlmRuntime>(batch_scheduler_config_, runtime_config_, context_);
+
+  auto req = CreateMockInferRequest({10}, {20}, {10, 99, 77});
+  std::vector<std::shared_ptr<InferRequest>> reqs = {req};
+
+  llm_runtime->DraftTokenFilter(reqs);
+
+  // Token comparison: draft[0]=10 == sampling[0]=10 → accept; draft[1]=20 != sampling[1]=99 → stop
+  EXPECT_EQ(req->accepted_tokens.size(), 1u);
+  EXPECT_EQ(req->accepted_tokens[0], 10);
+  EXPECT_EQ(req->generated_token, 99);  // sampling_result_tokens[1]
+}
+
 }  // namespace ksana_llm

@@ -5,9 +5,13 @@
 #include "ksana_llm/runtime/llm_runtime.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <execution>
 #include <atomic>
 #include <memory>
+#include <sstream>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -35,6 +39,32 @@ LlmRuntime::LlmRuntime(const BatchSchedulerConfig& batch_scheduler_config, const
   }
   threadpool_ = std::make_shared<ThreadPool>(2);
   threadpool_->Start();
+
+  // Parse MOCK_DRAFT_HIT_RATES env var (e.g. "0.82,0.50") for deterministic draft acceptance in benchmark mode.
+  // rates_[0] applies to MTP draft tokens; rates_[1] applies to Trie draft tokens (when MTP is fully accepted).
+  const char* mock_rates_env = std::getenv("MOCK_DRAFT_HIT_RATES");
+  if (mock_rates_env != nullptr) {
+    std::string rates_str(mock_rates_env);
+    std::istringstream ss(rates_str);
+    std::string rate_token;
+    while (std::getline(ss, rate_token, ',')) {
+      if (!rate_token.empty()) {
+        try {
+          float rate = std::stof(rate_token);
+          if (rate < 0.0f || rate > 1.0f) {
+            KLLM_LOG_WARNING << "MOCK_DRAFT_HIT_RATES value " << rate
+                             << " is out of range [0.0, 1.0], clamping";
+            rate = std::max(0.0f, std::min(1.0f, rate));
+          }
+          mock_draft_hit_rates_.push_back(rate);
+        } catch (const std::exception& e) {
+          KLLM_LOG_ERROR << "Failed to parse MOCK_DRAFT_HIT_RATES value '" << rate_token << "': " << e.what();
+        }
+      }
+    }
+    KLLM_LOG_INFO << "MOCK_DRAFT_HIT_RATES enabled with " << mock_draft_hit_rates_.size()
+                  << " rate(s): " << rates_str;
+  }
 }
 
 void LlmRuntime::SetCacheManagers(std::vector<std::shared_ptr<CacheManagerInterface>> cache_managers) {
@@ -391,31 +421,62 @@ void LlmRuntime::DraftTokenFilter(std::vector<std::shared_ptr<InferRequest>>& re
     size_t draft_hit_num = 0;
     req->accepted_tokens.clear();
     std::vector<int> draft_tokens = req->draft_tokens.GetDraftTokens();
-    for (size_t i = 0; i < draft_tokens.size(); ++i) {
-      if (req->sampling_result_tokens[i] != draft_tokens[i]) {
-        break;
+
+    if (!mock_draft_hit_rates_.empty()) {
+      // Mock mode: deterministically compute accepted draft count from rates without comparing tokens.
+      // This ensures reproducible TPOT across benchmark runs when MOCK_DRAFT_HIT_RATES is set.
+      // rates_[0] applies to MTP draft tokens; rates_[1] applies to Trie tokens (when all MTP accepted).
+      const size_t mtp_size = req->draft_tokens.mtp.size();
+      const size_t trie_size = req->draft_tokens.trie.size();
+      const float rate0 = mock_draft_hit_rates_[0];
+
+      if (mtp_size > 0) {
+        // Apply rates_[0] to MTP group; only proceed to Trie if all MTP tokens are accepted.
+        const size_t mtp_hit =
+            std::min(mtp_size, static_cast<size_t>(std::round(rate0 * static_cast<float>(mtp_size))));
+        if (mtp_hit >= mtp_size && trie_size > 0 && mock_draft_hit_rates_.size() > 1) {
+          const float rate1 = mock_draft_hit_rates_[1];
+          const size_t trie_hit =
+              std::min(trie_size, static_cast<size_t>(std::round(rate1 * static_cast<float>(trie_size))));
+          draft_hit_num = mtp_hit + trie_hit;
+        } else {
+          draft_hit_num = mtp_hit;
+        }
+      } else {
+        // No MTP tokens: apply rates_[0] directly to Trie tokens.
+        const size_t trie_hit =
+            std::min(trie_size, static_cast<size_t>(std::round(rate0 * static_cast<float>(trie_size))));
+        draft_hit_num = trie_hit;
       }
-      // stop if stop token
-      if (std::find(req->sampling_config.stop_token_ids.begin(), req->sampling_config.stop_token_ids.end(),
-                    draft_tokens[i]) != req->sampling_config.stop_token_ids.end()) {
-        break;
-      }
-      // Grammar check for the new generated token
-      if (req->grammar_matcher != nullptr) {
-        int new_token = req->sampling_result_tokens[i + 1];
-        bool new_token_accepted = req->grammar_matcher->AcceptToken(new_token);
-        if (!new_token_accepted) {
-          // Grammar rejects the new_token
-          KLLM_LOG_DEBUG << "Grammar rejected new_token " << new_token << " for request " << req->req_id
-                         << ", will not use it as generated_token";
+      KLLM_LOG_DEBUG << "mock draft accepted: " << draft_hit_num << " / " << req->draft_tokens.size()
+                     << " (mtp=" << mtp_size << ", trie=" << trie_size << ")";
+    } else {
+      for (size_t i = 0; i < draft_tokens.size(); ++i) {
+        if (req->sampling_result_tokens[i] != draft_tokens[i]) {
           break;
         }
+        // stop if stop token
+        if (std::find(req->sampling_config.stop_token_ids.begin(), req->sampling_config.stop_token_ids.end(),
+                      draft_tokens[i]) != req->sampling_config.stop_token_ids.end()) {
+          break;
+        }
+        // Grammar check for the new generated token
+        if (req->grammar_matcher != nullptr) {
+          int new_token = req->sampling_result_tokens[i + 1];
+          bool new_token_accepted = req->grammar_matcher->AcceptToken(new_token);
+          if (!new_token_accepted) {
+            // Grammar rejects the new_token
+            KLLM_LOG_DEBUG << "Grammar rejected new_token " << new_token << " for request " << req->req_id
+                           << ", will not use it as generated_token";
+            break;
+          }
+        }
+        ++draft_hit_num;
       }
-      ++draft_hit_num;
+      KLLM_LOG_DEBUG << "draft accepted: " << draft_hit_num << " / " << req->draft_tokens.size()
+                     << ". samp: " << req->sampling_result_tokens << ", draft: " << draft_tokens;
     }
 
-    KLLM_LOG_DEBUG << "draft accepted: " << draft_hit_num << " / " << req->draft_tokens.size()
-                   << ". samp: " << req->sampling_result_tokens << ", draft: " << draft_tokens;
     req->accepted_tokens.swap(draft_tokens);
     req->accepted_tokens.resize(draft_hit_num);
     req->generated_token = req->sampling_result_tokens[draft_hit_num];  // only kStepGenerateTokenNum(1) token now
